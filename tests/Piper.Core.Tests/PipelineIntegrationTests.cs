@@ -187,7 +187,7 @@ public class PipelineIntegrationTests
 
         // Act
         await runtime.StartAsync(CancellationToken.None);
-        await Task.Delay(1000); // Give enough time for all items to process through multiple stages
+        await Task.Delay(1500); // Give enough time for all items to process through multiple stages
         await runtime.StopAsync(CancellationToken.None);
 
         // Assert
