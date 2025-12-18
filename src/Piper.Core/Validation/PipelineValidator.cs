@@ -16,6 +16,7 @@ public sealed class PipelineValidator : IPipelineValidator
         ValidateRequiredPadsConnected(definition);
         ValidateTypeCompatibility(definition);
         ValidateNoIllegalFanIn(definition);
+        ValidateSingleWriterPerOutputPad(definition);
     }
 
     private static void ValidateUniqueElementNames(IPipelineDefinition definition)
@@ -88,6 +89,25 @@ public sealed class PipelineValidator : IPipelineValidator
             throw new InvalidOperationException(
                 $"Illegal fan-in detected (multiple links to same input pad): {string.Join(", ", violations)}. " +
                 "Use a Merge element to combine multiple sources.");
+        }
+    }
+
+    private static void ValidateSingleWriterPerOutputPad(IPipelineDefinition definition)
+    {
+        var outputPadConnections = definition.Links
+            .GroupBy(l => l.Source)
+            .Where(g => g.Count() > 1)
+            .ToList();
+
+        if (outputPadConnections.Any())
+        {
+            var violations = outputPadConnections
+                .Select(g => $"'{g.Key.Name}' has {g.Count()} outgoing connections")
+                .ToList();
+
+            throw new InvalidOperationException(
+                $"Illegal fan-out detected (multiple links from same output pad): {string.Join(", ", violations)}. " +
+                "Use a Tee element to duplicate items to multiple outputs.");
         }
     }
 }

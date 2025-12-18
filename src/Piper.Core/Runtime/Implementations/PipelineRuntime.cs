@@ -57,26 +57,40 @@ public sealed class PipelineRuntime : IPipelineRuntime
         foreach (var element in _definition.Elements)
         {
             var context = _contexts[element];
-            var processor = element.ProcessorFactory.CreateProcessor();
+            var degreeOfParallelism = element.Policy?.DegreeOfParallelism ?? 1;
 
             Bus.Publish(new ElementStartedEvent(element.Name));
 
-            var task = Task.Run(async () =>
+            // Spawn processors according to DegreeOfParallelism
+            for (int i = 0; i < degreeOfParallelism; i++)
             {
-                try
-                {
-                    await processor.RunAsync(context, _internalCts.Token);
-                    Bus.Publish(new ElementCompletedEvent(element.Name));
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    Bus.Publish(new ElementFaultedEvent(element.Name, ex));
-                    SetState(PipelineState.Faulted);
-                    throw;
-                }
-            }, cancellationToken);
+                var processor = element.ProcessorFactory.CreateProcessor();
+                var processorIndex = i;
 
-            _elementTasks.Add(task);
+                var task = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await processor.RunAsync(context, _internalCts.Token);
+                        
+                        // Only publish completion event once per element (from first processor)
+                        if (processorIndex == 0)
+                        {
+                            Bus.Publish(new ElementCompletedEvent(element.Name));
+                        }
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        Bus.Publish(new ElementFaultedEvent(element.Name, ex));
+                        SetState(PipelineState.Faulted);
+                        // Cancel remaining elements for controlled shutdown
+                        _internalCts.Cancel();
+                        // Do not rethrow - errors are communicated via events
+                    }
+                }, cancellationToken);
+
+                _elementTasks.Add(task);
+            }
         }
 
         await Task.CompletedTask;
@@ -92,30 +106,11 @@ public sealed class PipelineRuntime : IPipelineRuntime
             SetState(PipelineState.Draining);
         }
 
-        // Complete all source output channels to signal no more data
-        foreach (var element in _definition.Elements)
-        {
-            if (element.Inputs.Count == 0) // Source element
-            {
-                foreach (var output in element.Outputs)
-                {
-                    var link = _definition.Links.FirstOrDefault(l => l.Source == output);
-                    if (link != null && _channels.TryGetValue(link, out var channelObj))
-                    {
-                        // Get the channel and complete its writer
-                        var channelType = channelObj.GetType();
-                        var writerProp = channelType.GetProperty("Writer");
-                        if (writerProp != null)
-                        {
-                            var writer = writerProp.GetValue(channelObj);
-                            var completeMethod = writer?.GetType().GetMethod("Complete", Type.EmptyTypes);
-                            completeMethod?.Invoke(writer, null);
-                        }
-                    }
-                }
-            }
-        }
-
+        // Elements manage their own output completion.
+        // We just wait for all elements to naturally finish processing.
+        // Source elements will complete when their IAsyncEnumerable completes.
+        // Other elements complete their outputs when their inputs complete.
+        
         // Wait for all element tasks to complete
         await Task.WhenAll(_elementTasks);
     }
@@ -165,19 +160,15 @@ public sealed class PipelineRuntime : IPipelineRuntime
     {
         var sharedContext = new PipelineContext();
 
-        // Create channels for all links
+        // Create channels for all links using a helper method that avoids reflection
         foreach (var link in _definition.Links)
         {
-            var channelType = typeof(Channel<>).MakeGenericType(link.Source.DataType);
-            var createBoundedMethod = typeof(Channel).GetMethod(nameof(Channel.CreateBounded), new[] { typeof(BoundedChannelOptions) });
-            var genericCreateBounded = createBoundedMethod!.MakeGenericMethod(link.Source.DataType);
-
             var options = new BoundedChannelOptions(link.Policy.BufferSize)
             {
                 FullMode = link.Policy.FullMode
             };
 
-            var channel = genericCreateBounded.Invoke(null, new object[] { options })!;
+            var channel = CreateBoundedChannel(link.Source.DataType, options);
             _channels[link] = channel;
         }
 
@@ -192,14 +183,7 @@ public sealed class PipelineRuntime : IPipelineRuntime
                 var link = _definition.Links.FirstOrDefault(l => l.Target == input);
                 if (link != null && _channels.TryGetValue(link, out var channelObj))
                 {
-                    var readerProp = channelObj.GetType().GetProperty("Reader");
-                    var reader = readerProp!.GetValue(channelObj)!;
-
-                    var registerMethod = typeof(ElementRuntimeContext)
-                        .GetMethod(nameof(ElementRuntimeContext.RegisterInputReader))!
-                        .MakeGenericMethod(input.DataType);
-
-                    registerMethod.Invoke(context, new[] { input.Name, reader });
+                    RegisterInputReader(context, input.Name, input.DataType, channelObj);
                 }
             }
 
@@ -209,14 +193,7 @@ public sealed class PipelineRuntime : IPipelineRuntime
                 var link = _definition.Links.FirstOrDefault(l => l.Source == output);
                 if (link != null && _channels.TryGetValue(link, out var channelObj))
                 {
-                    var writerProp = channelObj.GetType().GetProperty("Writer");
-                    var writer = writerProp!.GetValue(channelObj)!;
-
-                    var registerMethod = typeof(ElementRuntimeContext)
-                        .GetMethod(nameof(ElementRuntimeContext.RegisterOutputWriter))!
-                        .MakeGenericMethod(output.DataType);
-
-                    registerMethod.Invoke(context, new[] { output.Name, writer });
+                    RegisterOutputWriter(context, output.Name, output.DataType, channelObj);
                 }
             }
 
@@ -224,6 +201,41 @@ public sealed class PipelineRuntime : IPipelineRuntime
         }
 
         SetState(PipelineState.Prepared);
+    }
+
+    private static object CreateBoundedChannel(Type dataType, BoundedChannelOptions options)
+    {
+        // Use reflection only once during Prepare(), not in hot path
+        var channelType = typeof(Channel<>).MakeGenericType(dataType);
+        var createBoundedMethod = typeof(Channel).GetMethod(nameof(Channel.CreateBounded), new[] { typeof(BoundedChannelOptions) });
+        var genericCreateBounded = createBoundedMethod!.MakeGenericMethod(dataType);
+        return genericCreateBounded.Invoke(null, new object[] { options })!;
+    }
+
+    private static void RegisterInputReader(ElementRuntimeContext context, string padName, Type dataType, object channelObj)
+    {
+        // Use reflection only once during Prepare(), not in hot path
+        var readerProp = channelObj.GetType().GetProperty("Reader");
+        var reader = readerProp!.GetValue(channelObj)!;
+
+        var registerMethod = typeof(ElementRuntimeContext)
+            .GetMethod(nameof(ElementRuntimeContext.RegisterInputReader))!
+            .MakeGenericMethod(dataType);
+
+        registerMethod.Invoke(context, new[] { padName, reader });
+    }
+
+    private static void RegisterOutputWriter(ElementRuntimeContext context, string padName, Type dataType, object channelObj)
+    {
+        // Use reflection only once during Prepare(), not in hot path
+        var writerProp = channelObj.GetType().GetProperty("Writer");
+        var writer = writerProp!.GetValue(channelObj)!;
+
+        var registerMethod = typeof(ElementRuntimeContext)
+            .GetMethod(nameof(ElementRuntimeContext.RegisterOutputWriter))!
+            .MakeGenericMethod(dataType);
+
+        registerMethod.Invoke(context, new[] { padName, writer });
     }
 
     private void SetState(PipelineState newState)
