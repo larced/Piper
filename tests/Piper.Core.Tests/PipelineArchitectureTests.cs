@@ -64,7 +64,8 @@ public class PipelineArchitectureTests
 
         // Act
         await runtime.StartAsync(CancellationToken.None);
-        await Task.Delay(1000); // Give time to process
+        // Integration test: wait for async processing to complete (10 items * 10ms delay each)
+        await Task.Delay(1000);
         await runtime.StopAsync(CancellationToken.None);
 
         // Assert - All items should be processed
@@ -108,16 +109,18 @@ public class PipelineArchitectureTests
         {
             await foreach (var evt in runtime.Bus.Events(cts.Token))
             {
-                if (evt is Piper.Core.Events.ElementFaultedEvent faultedEvent && faultedEvent.ElementName != null)
+                if (evt is Piper.Core.Events.ElementFaultedEvent faultedEvent)
                 {
-                    faultEvents.Add(faultedEvent.ElementName);
+                    // ElementFaultedEvent requires non-null elementName in constructor
+                    faultEvents.Add(faultedEvent.ElementName!);
                 }
             }
         });
 
         // Act
         await runtime.StartAsync(CancellationToken.None);
-        await Task.Delay(1000); // Give time for fault to occur
+        // Integration test: wait for async fault to propagate (5 items * 10ms delay each)
+        await Task.Delay(1000);
         
         // The pipeline should be in Faulted state
         Assert.Equal(Piper.Core.Runtime.Interfaces.PipelineState.Faulted, runtime.State);
