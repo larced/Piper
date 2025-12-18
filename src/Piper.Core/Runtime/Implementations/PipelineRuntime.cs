@@ -61,11 +61,14 @@ public sealed class PipelineRuntime : IPipelineRuntime
 
             Bus.Publish(new ElementStartedEvent(element.Name));
 
+            // Track completion and faults per element to avoid race conditions
+            var completionSent = 0; // 0 = not sent, 1 = sent
+            var faultSent = 0; // 0 = not sent, 1 = sent
+
             // Spawn processors according to DegreeOfParallelism
             for (int i = 0; i < degreeOfParallelism; i++)
             {
                 var processor = element.ProcessorFactory.CreateProcessor();
-                var processorIndex = i;
 
                 var task = Task.Run(async () =>
                 {
@@ -73,17 +76,21 @@ public sealed class PipelineRuntime : IPipelineRuntime
                     {
                         await processor.RunAsync(context, _internalCts.Token);
                         
-                        // Only publish completion event once per element (from first processor)
-                        if (processorIndex == 0)
+                        // Only publish completion event once per element using atomic operation
+                        if (Interlocked.CompareExchange(ref completionSent, 1, 0) == 0)
                         {
                             Bus.Publish(new ElementCompletedEvent(element.Name));
                         }
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
-                        Bus.Publish(new ElementFaultedEvent(element.Name, ex));
-                        SetState(PipelineState.Faulted);
-                        // Cancel remaining elements for controlled shutdown
+                        // Only publish first fault event per element using atomic operation
+                        if (Interlocked.CompareExchange(ref faultSent, 1, 0) == 0)
+                        {
+                            Bus.Publish(new ElementFaultedEvent(element.Name, ex));
+                            SetState(PipelineState.Faulted);
+                        }
+                        // Cancel remaining elements for controlled shutdown (idempotent)
                         _internalCts.Cancel();
                         // Do not rethrow - errors are communicated via events
                     }
