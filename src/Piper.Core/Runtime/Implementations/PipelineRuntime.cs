@@ -70,9 +70,11 @@ public sealed class PipelineRuntime : IPipelineRuntime
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
+                    // Event-driven fault handling - publish event and cancel pipeline
                     Bus.Publish(new ElementFaultedEvent(element.Name, ex));
                     SetState(PipelineState.Faulted);
-                    throw;
+                    _internalCts.Cancel();
+                    // Do not rethrow - errors are communicated via events, not exceptions
                 }
             }, cancellationToken);
 
@@ -92,32 +94,21 @@ public sealed class PipelineRuntime : IPipelineRuntime
             SetState(PipelineState.Draining);
         }
 
-        // Complete all source output channels to signal no more data
-        foreach (var element in _definition.Elements)
-        {
-            if (element.Inputs.Count == 0) // Source element
-            {
-                foreach (var output in element.Outputs)
-                {
-                    var link = _definition.Links.FirstOrDefault(l => l.Source == output);
-                    if (link != null && _channels.TryGetValue(link, out var channelObj))
-                    {
-                        // Get the channel and complete its writer
-                        var channelType = channelObj.GetType();
-                        var writerProp = channelType.GetProperty("Writer");
-                        if (writerProp != null)
-                        {
-                            var writer = writerProp.GetValue(channelObj);
-                            var completeMethod = writer?.GetType().GetMethod("Complete", Type.EmptyTypes);
-                            completeMethod?.Invoke(writer, null);
-                        }
-                    }
-                }
-            }
-        }
+        // Cancel the internal token to signal all elements to stop accepting new inputs
+        // and complete their work. Elements are responsible for completing their own
+        // output channels in their finally blocks.
+        _internalCts.Cancel();
 
-        // Wait for all element tasks to complete
-        await Task.WhenAll(_elementTasks);
+        // Wait for all element tasks to complete naturally
+        // Each element will complete its outputs in its finally block
+        try
+        {
+            await Task.WhenAll(_elementTasks);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected during drain
+        }
     }
 
     public async Task StopAsync(CancellationToken cancellationToken)

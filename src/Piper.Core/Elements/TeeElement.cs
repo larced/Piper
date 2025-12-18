@@ -29,6 +29,13 @@ public sealed class TeeElementProcessorFactory<T> : IElementProcessorFactory
 
 /// <summary>
 /// Processor for tee elements that duplicate items to multiple outputs.
+/// 
+/// COMPLETION SEMANTICS:
+/// This processor owns the output channels and is responsible for completing them.
+/// This is safe because:
+/// 1. Validation ensures one-writer-per-output-pad (no shared channels)
+/// 2. The finally block guarantees completion even on cancellation
+/// 3. Completion happens after all input is consumed or cancelled
 /// </summary>
 internal sealed class TeeElementProcessor<T> : IElementProcessor
 {
@@ -70,6 +77,8 @@ internal sealed class TeeElementProcessor<T> : IElementProcessor
         }
         finally
         {
+            // Element owns completion of its output channels
+            // Safe because validation enforces single-writer-per-output
             foreach (var writer in writers)
             {
                 writer.Complete();

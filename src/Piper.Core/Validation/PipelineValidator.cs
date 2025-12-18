@@ -16,6 +16,8 @@ public sealed class PipelineValidator : IPipelineValidator
         ValidateRequiredPadsConnected(definition);
         ValidateTypeCompatibility(definition);
         ValidateNoIllegalFanIn(definition);
+        ValidateNoIllegalFanOut(definition);
+        ValidateDegreeOfParallelism(definition);
     }
 
     private static void ValidateUniqueElementNames(IPipelineDefinition definition)
@@ -88,6 +90,41 @@ public sealed class PipelineValidator : IPipelineValidator
             throw new InvalidOperationException(
                 $"Illegal fan-in detected (multiple links to same input pad): {string.Join(", ", violations)}. " +
                 "Use a Merge element to combine multiple sources.");
+        }
+    }
+
+    private static void ValidateNoIllegalFanOut(IPipelineDefinition definition)
+    {
+        // Validate that each output pad has at most one outgoing link
+        // This ensures single-writer-per-channel semantics for safe completion
+        var outputPadConnections = definition.Links
+            .GroupBy(l => l.Source)
+            .Where(g => g.Count() > 1)
+            .ToList();
+
+        if (outputPadConnections.Any())
+        {
+            var violations = outputPadConnections
+                .Select(g => $"'{g.Key.Name}' has {g.Count()} outgoing connections")
+                .ToList();
+
+            throw new InvalidOperationException(
+                $"Illegal fan-out detected (multiple links from same output pad): {string.Join(", ", violations)}. " +
+                "Use a Tee element to duplicate items to multiple outputs.");
+        }
+    }
+
+    private static void ValidateDegreeOfParallelism(IPipelineDefinition definition)
+    {
+        foreach (var element in definition.Elements)
+        {
+            if (element.Policy != null && element.Policy.DegreeOfParallelism > 1)
+            {
+                throw new NotSupportedException(
+                    $"Element '{element.Name}' has DegreeOfParallelism set to {element.Policy.DegreeOfParallelism}, " +
+                    "but only DegreeOfParallelism = 1 is currently supported. " +
+                    "Multi-processor parallelism is reserved for future implementation.");
+            }
         }
     }
 }

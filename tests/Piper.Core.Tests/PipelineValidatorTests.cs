@@ -108,6 +108,53 @@ public class PipelineValidatorTests
         Assert.Contains("fan-in", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public void Validate_IllegalFanOut_Throws()
+    {
+        // Arrange
+        var source = SourceElement.Create("source", ct => GetNumbersAsync(ct));
+        var sink1 = SinkElement.Create<int>("sink1", x => { });
+        var sink2 = SinkElement.Create<int>("sink2", x => { });
+
+        var definition = new PipelineDefinition(
+            "illegal-fanout",
+            new[] { source, sink1, sink2 },
+            new[]
+            {
+                new PipelineLinkDefinition(source.Outputs[0], sink1.Inputs[0]),
+                new PipelineLinkDefinition(source.Outputs[0], sink2.Inputs[0]) // Duplicate source
+            });
+
+        var validator = new PipelineValidator();
+
+        // Act & Assert
+        var ex = Assert.Throws<InvalidOperationException>(() => validator.Validate(definition));
+        Assert.Contains("fan-out", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Validate_DegreeOfParallelismGreaterThanOne_Throws()
+    {
+        // Arrange
+        var builder = new PipelineBuilder("parallel-pipeline");
+        var source = SourceElement.Create("source", ct => GetNumbersAsync(ct), 
+            new ElementPolicy { DegreeOfParallelism = 2 }); // Not supported yet
+        var sink = SinkElement.Create<int>("sink", x => { });
+
+        var definition = builder
+            .Add(source)
+            .Add(sink)
+            .Link(source.Outputs[0], sink.Inputs[0])
+            .BuildDefinition();
+
+        var validator = new PipelineValidator();
+
+        // Act & Assert
+        var ex = Assert.Throws<NotSupportedException>(() => validator.Validate(definition));
+        Assert.Contains("DegreeOfParallelism", ex.Message);
+        Assert.Contains("only DegreeOfParallelism = 1 is currently supported", ex.Message);
+    }
+
     private static async IAsyncEnumerable<int> GetNumbersAsync([EnumeratorCancellation] CancellationToken ct)
     {
         for (int i = 0; i < 5; i++)
